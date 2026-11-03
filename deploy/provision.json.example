@@ -1,0 +1,10 @@
+{
+  "_comment": "/etc/belajarhub/provision.json — 기본값과 다른 항목만 적으면 된다 (root 소유, 0644)",
+  "domain": "belajarhub.id",
+  "php_fpm_socket": "/run/php/php8.1-fpm.sock",
+  "process_timeout": "5h",
+  "spring_jar": "build/libs/dht11-0.0.1-SNAPSHOT.jar",
+  "mqtt_topic_prefix": "unsia",
+  "node_port_range": [9001, 9999],
+  "spring_port_range": [8001, 8999]
+}

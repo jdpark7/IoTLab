@@ -1,0 +1,42 @@
+{% extends "labs/base.html" %}
+{% block title %}{{ s.username }}{% endblock %}
+{% block content %}
+<div class="row" style="justify-content:space-between;margin-bottom:12px">
+  <h1 style="margin:0">{{ s.username }} {% if s.full_name %}<span class="muted">· {{ s.full_name }}</span>{% endif %} <span class="badge b-{{ s.status }}">{{ s.get_status_display }}</span></h1>
+  <a class="btn danger" href="{% url 'student_remove' s.username %}">Remove…</a>
+</div>
+{% if s.last_error %}<div class="card"><b style="color:var(--bad)">Last error</b><pre>{{ s.last_error }}</pre></div>{% endif %}
+<div class="grid">
+  <div class="card">
+    <h2>Environment</h2>
+    <dl class="kv">
+      <dt>Password</dt><dd><code>{{ s.initial_password }}</code></dd>
+      <dt>Node-RED port</dt><dd class="mono">{{ s.node_port }}</dd>
+      <dt>Spring port</dt><dd class="mono">{{ s.spring_port }}</dd>
+      <dt>MQTT topic</dt><dd class="mono">{{ s.mqtt_topic }}</dd>
+      <dt>Portal login</dt><dd>{% if s.user %}{{ s.user.username }}{% if not s.user.is_active %} <span class="badge b-failed">disabled</span>{% endif %}{% else %}<span class="muted">none</span>{% endif %}</dd>
+      <dt>Provisioned</dt><dd>{{ s.provisioned_at|default:"—" }}</dd>
+      {% for label, url in s.links %}<dt>{{ label }}</dt><dd><a href="{{ url }}" target="_blank" rel="noopener">{{ url }}</a></dd>{% endfor %}
+    </dl>
+    <div class="row" style="margin-top:12px">
+      <form class="inline" method="post">{% csrf_token %}<button name="action" value="password" onclick="return confirm('Generate a new password for SSH, Node-RED, MQTT, MariaDB and portal?')">New password</button></form>
+      <form class="inline" method="post">{% csrf_token %}<button name="action" value="portal_password">Reset portal login</button></form>
+    </div>
+  </div>
+  <form class="card" method="post">{% csrf_token %}
+    <h2>Configuration</h2>
+    <label for="id_full_name">Full name</label>{{ form.full_name }}
+    <label for="id_email">Email</label>{{ form.email }}
+    <label for="id_cohort">Class / cohort</label>{{ form.cohort }}
+    <label>Components</label>
+    <ul class="checks">{% for c in form.components %}<li>{{ c.tag }} <label for="{{ c.id_for_label }}">{{ c.choice_label }}</label></li>{% endfor %}</ul>
+    <button class="primary" name="action" value="apply">Save &amp; re-apply</button>
+    <p class="helptext">Re-applying is safe: it regenerates nginx / supervisor / sudoers / Node-RED settings (old files are kept as <code>.bak</code>) and never deletes student code.</p>
+  </form>
+</div>
+{% include "labs/_services.html" %}
+<div class="card">
+  <h2>Recent jobs</h2>
+  {% include "labs/_jobs_table.html" %}
+</div>
+{% endblock %}

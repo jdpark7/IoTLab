@@ -1,0 +1,4 @@
+# /etc/sudoers.d/belajarhub-portal  (0440 root:root)
+# 포털 프로세스(belajarhub 사용자)는 프로비저닝 헬퍼 하나만 root 로 실행할 수 있다.
+# 헬퍼는 stdin JSON 을 엄격히 검증하며 'students' 그룹 계정만 관리한다.
+belajarhub ALL=(root) NOPASSWD: /usr/local/sbin/belajarhub-provision

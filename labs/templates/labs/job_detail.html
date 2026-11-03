@@ -1,0 +1,21 @@
+{% extends "labs/base.html" %}
+{% block title %}Job #{{ job.pk }}{% endblock %}
+{% block head %}{% if job.status == "queued" or job.status == "running" %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block content %}
+<h1>Job #{{ job.pk }} — {{ job.get_kind_display }} {{ job.username }} <span class="badge b-{{ job.status }}">{{ job.get_status_display }}</span></h1>
+<div class="card">
+  <dl class="kv"><dt>Created</dt><dd>{{ job.created_at }} {% if job.created_by %}by {{ job.created_by }}{% endif %}</dd>
+  <dt>Started</dt><dd>{{ job.started_at|default:"—" }}</dd><dt>Finished</dt><dd>{{ job.finished_at|default:"—" }}</dd></dl>
+  {% if job.error %}<pre style="color:var(--bad)">{{ job.error }}</pre>{% endif %}
+</div>
+<div class="card">
+  <h2>Steps</h2>
+  <div class="tablewrap"><table>
+    <tr><th>Step</th><th>Result</th><th>Detail</th></tr>
+    {% for st in job.result.steps %}
+    <tr><td class="mono">{{ st.step }}</td><td>{% if st.ok %}<span class="badge b-done">ok</span>{% else %}<span class="badge b-failed">failed</span>{% endif %}</td><td><span class="mono">{{ st.detail }}</span></td></tr>
+    {% empty %}<tr><td colspan="3" class="muted">No steps recorded.</td></tr>{% endfor %}
+  </table></div>
+</div>
+{% if job.student %}<a href="{% url 'student_detail' job.username %}">← {{ job.username }}</a>{% endif %}
+{% endblock %}

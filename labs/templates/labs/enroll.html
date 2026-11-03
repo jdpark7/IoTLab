@@ -1,0 +1,17 @@
+{% extends "labs/base.html" %}
+{% block title %}Add students{% endblock %}
+{% block content %}
+<h1>Add students</h1>
+<form method="post" enctype="multipart/form-data" class="card" style="max-width:760px">{% csrf_token %}
+  {% if form.non_field_errors %}<ul class="errorlist">{% for e in form.non_field_errors %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+  <label for="id_roster">{{ form.roster.label }}</label>{{ form.roster }}<div class="helptext">{{ form.roster.help_text }}</div>
+  <label for="id_csv_file">{{ form.csv_file.label }}</label>{{ form.csv_file }}
+  <label for="id_cohort">Class / cohort</label>{{ form.cohort }}<div class="helptext">{{ form.cohort.help_text }}</div>
+  <label>Components</label>{{ form.components.errors }}
+  <ul class="checks">{% for c in form.components %}<li>{{ c.tag }} <label for="{{ c.id_for_label }}">{{ c.choice_label }}</label></li>{% endfor %}</ul>
+  <p class="helptext">For each student this creates: a Linux account, /srv/{php,django,nodejs,spring}/&lt;user&gt;, nginx site <code>&lt;user&gt;.{{ LAB_DOMAIN }}</code>,
+    supervisor programs (django_/nodejs_/spring_&lt;user&gt;), sudoers rules for start/stop scripts, Node-RED settings, MQTT account &amp; ACL and a MariaDB database.
+    Ports and a password are assigned automatically.</p>
+  <p><button class="primary">Add and provision</button></p>
+</form>
+{% endblock %}

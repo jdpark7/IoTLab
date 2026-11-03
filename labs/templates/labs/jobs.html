@@ -1,0 +1,8 @@
+{% extends "labs/base.html" %}
+{% block title %}Jobs{% endblock %}
+{% block head %}{% if active %}<meta http-equiv="refresh" content="3">{% endif %}{% endblock %}
+{% block content %}
+<h1>Provisioning jobs</h1>
+{% if active %}<p class="muted">Jobs are running — this page refreshes automatically. (Requires <code>manage.py provision_worker</code> to be running.)</p>{% endif %}
+<div class="card">{% include "labs/_jobs_table.html" %}</div>
+{% endblock %}

@@ -1,0 +1,24 @@
+{% load labs_extras %}
+<div class="card">
+  <h2>Services</h2>
+  {% if status.error %}<p class="msgs"><span class="badge b-failed">status unavailable</span> <span class="muted">{{ status.error }}</span></p>{% endif %}
+  {% if not s.services %}<p class="muted">No process-based services enabled.</p>{% else %}
+  <div class="tablewrap"><table>
+    <tr><th>Service</th><th>State</th><th></th></tr>
+    {% for svc in s.services %}{% with st=status|get:svc %}
+    <tr>
+      <td><b>{{ svc }}</b><br><span class="mono muted">{{ svc }}_{{ s.username }}</span></td>
+      <td>{% if st %}<span class="badge b-{{ st.state }}">{{ st.state }}</span><br><span class="muted">{{ st.info }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td style="white-space:nowrap">
+        <form class="inline" method="post">{% csrf_token %}<input type="hidden" name="action" value="service"><input type="hidden" name="service" value="{{ svc }}">
+          <button name="op" value="start">Start</button>
+          <button name="op" value="restart">Restart</button>
+          <button name="op" value="stop">Stop</button>
+        </form>
+      </td>
+    </tr>
+    {% endwith %}{% endfor %}
+  </table></div>
+  <p class="helptext">Services stop automatically after the time limit (5 hours). Logs: <code>/srv/&lt;service&gt;/{{ s.username }}/log*</code></p>
+  {% endif %}
+</div>

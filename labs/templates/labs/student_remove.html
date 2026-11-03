@@ -1,0 +1,13 @@
+{% extends "labs/base.html" %}
+{% block title %}Remove {{ s.username }}{% endblock %}
+{% block content %}
+<h1>Remove {{ s.username }}</h1>
+<form method="post" class="card" style="max-width:640px">{% csrf_token %}
+  <p>This stops the student's services and removes their nginx site, supervisor programs, sudoers rules and MQTT account.
+     Files and the Linux account are kept unless you tick the box below.</p>
+  {{ form.non_field_errors }}
+  <p>{{ form.purge }} <label for="id_purge" style="display:inline;color:var(--bad)">{{ form.purge.label }}</label></p>
+  <label for="id_confirm">Type <code>{{ s.username }}</code> to confirm</label>{{ form.confirm }}{{ form.confirm.errors }}
+  <p><button class="danger">Remove</button> <a class="btn" href="{% url 'student_detail' s.username %}">Cancel</a></p>
+</form>
+{% endblock %}

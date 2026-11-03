@@ -1,0 +1,1005 @@
+#!/usr/bin/env python3
+"""
+belajarhub-provision — 학생 IoT 실습 환경을 만드는 root 전용 헬퍼.
+
+기존 쉘 스크립트(create_users.py, create_student_dirs.sh, create_php_sites.sh,
+generate_nginx_conf.sh, create_supervisor_django.sh, setup_spring_supervisor.sh,
+setup_node_red_mqtt_students.sh, add_*_sudoers.sh, deploy_mine_scripts.sh,
+create_mariadb_users.sh ...)가 하던 일을 학생 한 명 단위로, 멱등하게 수행한다.
+
+Django 포털은 이 스크립트만 sudo로 실행할 수 있다:
+    belajarhub ALL=(root) NOPASSWD: /usr/local/sbin/belajarhub-provision
+
+sudoers 로는 인자를 제한할 수 없으므로 모든 입력은 여기서 엄격히 검증한다.
+요청은 stdin 의 JSON 한 개, 결과는 stdout 의 JSON 한 개.
+
+  {"action": "create",  "username": "a10029", "password": "...",
+   "node_port": 9001, "spring_port": 8001,
+   "components": ["php","django","nodejs","spring","mariadb","mqtt"],
+   "force_password_change": false, "defer_reload": false}
+  {"action": "password", "username": "a10029", "password": "...", "node_port": 9001,
+   "components": [...]}
+  {"action": "service", "username": "a10029", "service": "nodejs", "op": "start"}
+  {"action": "status",  "username": "a10029"}
+  {"action": "remove",  "username": "a10029", "purge": false}
+  {"action": "reload"}
+
+테스트: BELAJARHUB_SANDBOX=/tmp/sb 로 실행하면 모든 경로가 /tmp/sb 아래로 바뀌고
+외부 명령은 실행하지 않고 기록만 한다 (root 불필요).
+"""
+
+import fcntl
+import grp
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# ---------------------------------------------------------------------------
+# 설정 (필요하면 /etc/belajarhub/provision.json 으로 덮어쓴다)
+# ---------------------------------------------------------------------------
+DEFAULTS = {
+    "domain": "belajarhub.id",
+    "ssl_certificate": "/etc/letsencrypt/live/belajarhub.id/fullchain.pem",
+    "ssl_certificate_key": "/etc/letsencrypt/live/belajarhub.id/privkey.pem",
+    "php_fpm_socket": "/run/php/php8.1-fpm.sock",
+    "student_group": "students",
+    "min_uid": 1000,
+    "process_timeout": "5h",
+    "spring_jar": "build/libs/dht11-0.0.1-SNAPSHOT.jar",
+    "spring_workdir": "sensordata",
+    "mqtt_topic_prefix": "unsia",
+    "node_port_range": [9001, 9999],
+    "spring_port_range": [8001, 8999],
+    "nginx_conf_dir": "/etc/nginx/conf.d",
+    "supervisor_conf_dir": "/etc/supervisor/conf.d",
+    "sudoers_dir": "/etc/sudoers.d",
+    "legacy_sudoers_file": "/etc/sudoers.d/students-supervisor",
+    "mosquitto_passwd": "/etc/mosquitto/passwd",
+    "mosquitto_acl": "/etc/mosquitto/acl",
+    "srv_base": "/srv",
+    "home_base": "/home",
+    "django_run_dir": "/run/django",
+    "lock_file": "/run/belajarhub-provision.lock",
+    "bin": {
+        "useradd": "/usr/sbin/useradd",
+        "userdel": "/usr/sbin/userdel",
+        "usermod": "/usr/sbin/usermod",
+        "groupadd": "/usr/sbin/groupadd",
+        "chpasswd": "/usr/sbin/chpasswd",
+        "chage": "/usr/bin/chage",
+        "visudo": "/usr/sbin/visudo",
+        "nginx": "/usr/sbin/nginx",
+        "systemctl": "/usr/bin/systemctl",
+        "supervisorctl": "/usr/bin/supervisorctl",
+        "htpasswd": "/usr/bin/htpasswd",
+        "mosquitto_passwd": "/usr/bin/mosquitto_passwd",
+        "mariadb": "/usr/bin/mariadb",
+        "node_red": "/usr/bin/node-red",
+        "node": "/usr/bin/node",
+        "java": "/usr/bin/java",
+        "timeout": "/usr/bin/timeout",
+    },
+}
+CONFIG_FILE = "/etc/belajarhub/provision.json"
+
+ALL_COMPONENTS = ("php", "django", "nodejs", "spring", "mariadb", "mqtt")
+SERVICES = ("django", "nodejs", "spring")          # supervisor 로 제어되는 것
+SERVICE_OPS = ("start", "stop", "restart", "status")
+SRV_DIRS = ("php", "django", "nodejs", "spring")
+
+# 기존 계정 중 M20017 처럼 대문자가 섞인 것도 있어 대소문자 모두 허용한다.
+USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{1,31}$")
+RESERVED = {
+    "root", "admin", "administrator", "www-data", "nobody", "daemon", "bin",
+    "sys", "sync", "mail", "mysql", "mariadb", "mosquitto", "nginx", "postgres",
+    "supervisor", "belajarhub", "portal", "mqtt", "www", "api", "ubuntu",
+    "debian", "sudo", "staff", "students",
+}
+
+SANDBOX = os.environ.get("BELAJARHUB_SANDBOX", "")
+DRY_RUN = bool(SANDBOX)
+
+
+class ProvisionError(Exception):
+    pass
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    path = P(CONFIG_FILE)
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            override = json.load(f)
+        bins = override.pop("bin", {})
+        cfg.update(override)
+        cfg["bin"].update(bins)
+    return cfg
+
+
+def P(path):
+    """샌드박스 모드에서는 절대경로를 샌드박스 아래로 옮긴다."""
+    if SANDBOX:
+        return os.path.join(SANDBOX, path.lstrip("/"))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# 결과 기록
+# ---------------------------------------------------------------------------
+class Result:
+    def __init__(self):
+        self.steps = []
+        self.data = {}
+        self.ok = True
+
+    def step(self, name, ok=True, detail=""):
+        self.steps.append({"step": name, "ok": ok, "detail": detail.strip()[-2000:]})
+        if not ok:
+            self.ok = False
+
+    def as_dict(self):
+        return {"ok": self.ok, "steps": self.steps, "data": self.data}
+
+
+def run(cmd, input_text=None, check=True, timeout=120):
+    """외부 명령 실행. 셸을 거치지 않는다."""
+    if DRY_RUN:
+        log = P("/commands.log")
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(" ".join(cmd) + ("   <<stdin>>" if input_text else "") + "\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    proc = subprocess.run(
+        cmd, input=input_text, capture_output=True, text=True, timeout=timeout,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"},
+    )
+    if check and proc.returncode != 0:
+        raise ProvisionError(
+            f"{os.path.basename(cmd[0])} 실패 (rc={proc.returncode}): "
+            f"{(proc.stderr or proc.stdout).strip()}"
+        )
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# 검증
+# ---------------------------------------------------------------------------
+def validate_username(username):
+    if not isinstance(username, str) or not USERNAME_RE.fullmatch(username):
+        raise ProvisionError(f"잘못된 username: {username!r}")
+    if username.lower() in RESERVED:
+        raise ProvisionError(f"예약된 username: {username}")
+    return username
+
+
+def validate_password(password):
+    if not isinstance(password, str) or not (8 <= len(password) <= 128):
+        raise ProvisionError("비밀번호는 8~128자여야 합니다")
+    if any(ord(c) < 32 or ord(c) == 127 for c in password):
+        raise ProvisionError("비밀번호에 제어문자를 쓸 수 없습니다")
+    return password
+
+
+def validate_port(value, port_range, name):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ProvisionError(f"{name} 는 정수여야 합니다")
+    lo, hi = port_range
+    if not (lo <= value <= hi):
+        raise ProvisionError(f"{name} {value} 가 허용 범위 {lo}-{hi} 밖입니다")
+    return value
+
+
+def validate_components(components):
+    if not isinstance(components, list) or not components:
+        raise ProvisionError("components 목록이 필요합니다")
+    bad = [c for c in components if c not in ALL_COMPONENTS]
+    if bad:
+        raise ProvisionError(f"알 수 없는 component: {bad}")
+    return [c for c in ALL_COMPONENTS if c in components]
+
+
+def get_pw(username):
+    if DRY_RUN:
+        return None
+    try:
+        return pwd.getpwnam(username)
+    except KeyError:
+        return None
+
+
+def in_student_group(cfg, username):
+    if DRY_RUN:
+        return True
+    try:
+        g = grp.getgrnam(cfg["student_group"])
+    except KeyError:
+        return False
+    pw = get_pw(username)
+    return username in g.gr_mem or (pw is not None and pw.pw_gid == g.gr_gid)
+
+
+def assert_managed(cfg, username, allow_missing=False):
+    """포털이 관리하는 학생 계정인지 확인 (교수/관리자 계정 보호)."""
+    pw = get_pw(username)
+    if pw is None:
+        if DRY_RUN or allow_missing:
+            return None
+        raise ProvisionError(f"Linux 사용자가 없습니다: {username}")
+    if pw.pw_uid < cfg["min_uid"]:
+        raise ProvisionError(f"시스템 계정은 관리할 수 없습니다: {username}")
+    if not in_student_group(cfg, username):
+        raise ProvisionError(
+            f"{username} 은(는) '{cfg['student_group']}' 그룹이 아니므로 관리할 수 없습니다"
+        )
+    return pw
+
+
+# ---------------------------------------------------------------------------
+# 파일 유틸
+# ---------------------------------------------------------------------------
+def write_file(path, content, mode=0o644, owner=None, backup=False):
+    real = P(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    if backup and os.path.isfile(real):
+        with open(real, encoding="utf-8") as f:
+            if f.read() == content:
+                chown(path, owner)
+                return False
+        shutil.copy2(real, real + ".bak")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".bh-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(tmp, mode)
+    os.replace(tmp, real)
+    chown(path, owner)
+    return True
+
+
+def chown(path, owner, recursive=False):
+    if owner is None or DRY_RUN:
+        return
+    uid, gid = owner
+    real = P(path)
+    os.lchown(real, uid, gid)
+    if recursive:
+        for root, dirs, files in os.walk(real):
+            for n in dirs + files:
+                os.lchown(os.path.join(root, n), uid, gid)
+
+
+def mkdir(path, owner=None, mode=0o755):
+    real = P(path)
+    if os.path.islink(real):
+        raise ProvisionError(f"심볼릭 링크는 허용되지 않습니다: {path}")
+    os.makedirs(real, mode=mode, exist_ok=True)
+    chown(path, owner)
+
+
+def remove_file(path):
+    real = P(path)
+    if os.path.lexists(real):
+        os.remove(real)
+        return True
+    return False
+
+
+def safe_rmtree(base, username):
+    """/srv/<svc>/<username> 만 지운다. 심볼릭 링크나 base 밖 경로는 거부."""
+    target = os.path.join(P(base), username)
+    if not os.path.lexists(target):
+        return False
+    if os.path.islink(target):
+        raise ProvisionError(f"심볼릭 링크라 삭제하지 않습니다: {target}")
+    if os.path.dirname(os.path.realpath(target)) != os.path.realpath(P(base)):
+        raise ProvisionError(f"경로 검증 실패: {target}")
+    shutil.rmtree(target)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# 템플릿
+# ---------------------------------------------------------------------------
+def nginx_conf(cfg, u, node_port, spring_port, components):
+    srv = cfg["srv_base"]
+    parts = [f"""# Managed by belajarhub-provision — 수동 수정 시 덮어써집니다.
+server {{
+    listen 80;
+    server_name {u}.{cfg['domain']};
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen 443 ssl;
+    server_name {u}.{cfg['domain']};
+
+    ssl_certificate     {cfg['ssl_certificate']};
+    ssl_certificate_key {cfg['ssl_certificate_key']};
+
+    root {srv}/php/{u}/public;
+    index index.php index.html;
+
+    access_log /var/log/nginx/{u}_access.log;
+    error_log  /var/log/nginx/{u}_error.log;
+
+    location / {{
+        index index.php index.html;
+        try_files $uri $uri/ /index.php?$query_string;
+    }}
+"""]
+    if "php" in components:
+        parts.append(f"""
+    location ~ \\.php$ {{
+        include fastcgi_params;
+        fastcgi_pass unix:{cfg['php_fpm_socket']};
+        fastcgi_index index.php;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+    }}
+""")
+    if "django" in components:
+        parts.append(f"""
+    location /django/ {{
+        proxy_redirect off;
+        proxy_pass http://unix:{cfg['django_run_dir']}/{u}.sock;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header SCRIPT_NAME /django;
+        proxy_set_header Cookie $http_cookie;
+    }}
+
+    location /django/static/ {{
+        alias {srv}/django/{u}/staticfiles/;
+    }}
+""")
+    if "nodejs" in components:
+        parts.append(f"""
+    location /nodejs/ {{
+        proxy_pass http://127.0.0.1:{node_port}/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }}
+""")
+    if "spring" in components:
+        parts.append(f"""
+    location /spring/ {{
+        proxy_pass http://127.0.0.1:{spring_port};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }}
+""")
+    parts.append("}\n")
+    return "".join(parts)
+
+
+def supervisor_conf(cfg, svc, u, home, node_port, spring_port):
+    b = cfg["bin"]
+    srv = cfg["srv_base"]
+    t = f"{b['timeout']} {cfg['process_timeout']} "
+    head = "; Managed by belajarhub-provision\n"
+    if svc == "django":
+        return head + f"""[program:django_{u}]
+directory={srv}/django/{u}
+command={t}{srv}/django/{u}/venv/bin/gunicorn --workers 1 --bind unix:{cfg['django_run_dir']}/{u}.sock myproject.wsgi:application
+user={u}
+autostart=false
+autorestart=false
+stopasgroup=true
+killasgroup=true
+
+stdout_logfile={srv}/django/{u}/log/{u}_stdout.log
+stderr_logfile={srv}/django/{u}/log/{u}_stderr.log
+redirect_stderr=false
+environment=PYTHONUNBUFFERED="1"
+"""
+    if svc == "nodejs":
+        red = f"{srv}/nodejs/{u}/.node-red"
+        return head + f"""[program:nodejs_{u}]
+command={t}{b['node_red']} --userDir {red} --settings {red}/settings.js
+directory={srv}/nodejs/{u}
+user={u}
+autostart=false
+autorestart=false
+stopasgroup=true
+killasgroup=true
+stdout_logfile={srv}/nodejs/{u}/log/nodejs_stdout.log
+stderr_logfile={srv}/nodejs/{u}/log/nodejs_stderr.log
+environment=HOME="{home}",USER="{u}"
+"""
+    if svc == "spring":
+        return head + f"""[program:spring_{u}]
+command={t}{b['java']} -jar {cfg['spring_jar']} --server.port={spring_port}
+directory={srv}/spring/{u}/{cfg['spring_workdir']}
+user={u}
+autostart=false
+autorestart=false
+startsecs=5
+stopasgroup=true
+killasgroup=true
+stdout_logfile={srv}/spring/{u}/logs/spring.log
+stderr_logfile={srv}/spring/{u}/logs/spring.err
+environment=HOME="{home}",USER="{u}"
+"""
+    raise ProvisionError(svc)
+
+
+def nodered_settings(u, node_port, bcrypt_hash, secret):
+    return f"""// Managed by belajarhub-provision (비밀번호 변경 시 다시 생성됩니다)
+module.exports = {{
+    uiPort: {node_port},
+    uiHost: "127.0.0.1",
+
+    adminAuth: {{
+        type: "credentials",
+        users: [{{
+            username: "{u}",
+            password: "{bcrypt_hash}",
+            permissions: "*"
+        }}]
+    }},
+
+    httpAdminRoot: "/",
+    httpNodeRoot: "/",
+
+    ui: {{
+        path: "ui"
+    }},
+
+    credentialSecret: "{secret}",
+
+    editorTheme: {{
+        projects: {{
+            enabled: false
+        }}
+    }}
+}}
+"""
+
+
+def control_script(cfg, op, program):
+    return f"#!/bin/bash\n/usr/bin/sudo -n {cfg['bin']['supervisorctl']} {op} {program}\n"
+
+
+def sudoers_content(cfg, u, services):
+    lines = [f"# Managed by belajarhub-provision for {u}"]
+    for svc in services:
+        for op in SERVICE_OPS:
+            lines.append(
+                f"{u} ALL=(root) NOPASSWD: {cfg['bin']['supervisorctl']} {op} {svc}_{u}"
+            )
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# 단계별 작업
+# ---------------------------------------------------------------------------
+def step_group(cfg, r):
+    if DRY_RUN:
+        run([cfg["bin"]["groupadd"], "-f", cfg["student_group"]])
+    else:
+        try:
+            grp.getgrnam(cfg["student_group"])
+        except KeyError:
+            run([cfg["bin"]["groupadd"], cfg["student_group"]])
+    r.step("group", True, cfg["student_group"])
+
+
+def step_linux_user(cfg, r, u, password, force_change):
+    b = cfg["bin"]
+    pw = get_pw(u)
+    created = False
+    if pw is None:
+        run([b["useradd"], "-m", "-s", "/bin/bash", "-G", cfg["student_group"], u])
+        created = True
+    else:
+        if pw.pw_uid < cfg["min_uid"]:
+            raise ProvisionError(f"시스템 계정은 사용할 수 없습니다: {u}")
+        if not in_student_group(cfg, u):
+            raise ProvisionError(
+                f"이미 존재하는 계정 {u} 이(가) '{cfg['student_group']}' 그룹이 아닙니다. "
+                f"기존 학생이면 'usermod -aG {cfg['student_group']} {u}' 실행 후 다시 시도하세요."
+            )
+    run([b["chpasswd"]], input_text=f"{u}:{password}\n")
+    if created and force_change:
+        run([b["chage"], "-d", "0", u])
+    r.step("linux_user", True, "created" if created else "exists, password set")
+
+
+def owner_of(u):
+    pw = get_pw(u)
+    if pw is None:
+        return None
+    return (pw.pw_uid, pw.pw_gid)
+
+
+def home_of(cfg, u):
+    pw = get_pw(u)
+    return pw.pw_dir if pw else f"{cfg['home_base']}/{u}"
+
+
+def step_dirs(cfg, r, u, components, node_port, spring_port):
+    own = owner_of(u)
+    srv = cfg["srv_base"]
+    home = home_of(cfg, u)
+    made = []
+
+    for svc in SRV_DIRS:
+        mkdir(f"{srv}/{svc}", owner=None)
+
+    if "php" in components:
+        mkdir(f"{srv}/php/{u}", own)
+        mkdir(f"{srv}/php/{u}/public", own)
+        idx = f"{srv}/php/{u}/public/index.php"
+        if not os.path.exists(P(idx)):
+            write_file(idx, f'<?php\necho "<h1>Welcome {u}</h1>";\necho "<p>PHP is working!</p>";\n?>\n',
+                       owner=own)
+        made.append("php")
+
+    if "django" in components:
+        mkdir(f"{srv}/django/{u}", own)
+        mkdir(f"{srv}/django/{u}/log", own)
+        made.append("django")
+
+    if "nodejs" in components:
+        for d in ("", "/.node-red", "/log", "/bin"):
+            mkdir(f"{srv}/nodejs/{u}{d}", own)
+        flows = f"{srv}/nodejs/{u}/.node-red/flows.json"
+        if not os.path.exists(P(flows)):
+            write_file(flows, "[]\n", owner=own)
+        write_file(f"{home}/nodejs-port", f"{node_port}\n", owner=own)
+        made.append("nodejs")
+
+    if "spring" in components:
+        for d in ("", "/bin", "/logs"):
+            mkdir(f"{srv}/spring/{u}{d}", own)
+        write_file(f"{srv}/spring/{u}/spring-port", f"{spring_port}\n", owner=own)
+        write_file(f"{home}/spring-port", f"{spring_port}\n", owner=own)
+        made.append("spring")
+
+    # 제어 스크립트: 기존 위치 그대로 (django → ~/bin, nodejs/spring → /srv/<svc>/<u>/bin)
+    script_dirs = {
+        "django": f"{home}/bin",
+        "nodejs": f"{srv}/nodejs/{u}/bin",
+        "spring": f"{srv}/spring/{u}/bin",
+    }
+    for svc in SERVICES:
+        if svc not in components:
+            continue
+        d = script_dirs[svc]
+        mkdir(d, own)
+        for op in SERVICE_OPS:
+            write_file(f"{d}/{op}_mine.sh", control_script(cfg, op, f"{svc}_{u}"),
+                       mode=0o755, owner=own)
+    r.step("directories", True, ", ".join(made))
+
+
+def step_nodered(cfg, r, u, password, node_port):
+    srv = cfg["srv_base"]
+    settings = f"{srv}/nodejs/{u}/.node-red/settings.js"
+    if DRY_RUN:
+        bcrypt_hash = "$2y$08$DRYRUNDRYRUNDRYRUNDRYRUNDRYRUNDRYRUNDRYRUNDRYRUNDRYRU"
+    else:
+        # -i: 비밀번호를 stdin 으로 받는다 (ps 에 노출되지 않음)
+        out = run([cfg["bin"]["htpasswd"], "-niBC", "8", u], input_text=password).stdout
+        bcrypt_hash = out.strip().split(":", 1)[1]
+    # credentialSecret 은 한 번 정하면 유지 (바꾸면 저장된 credential 을 못 읽음)
+    secret = f"{u}_node_red_secret_2026"
+    real = P(settings)
+    if os.path.isfile(real):
+        m = re.search(r'credentialSecret:\s*"([^"]+)"', open(real, encoding="utf-8").read())
+        if m:
+            secret = m.group(1)
+    else:
+        secret = f"{u}_{secrets.token_hex(12)}"
+    write_file(settings, nodered_settings(u, node_port, bcrypt_hash, secret),
+               owner=owner_of(u), backup=True)
+    r.step("nodered_settings", True, f"port {node_port}")
+
+
+def step_supervisor(cfg, r, u, components, node_port, spring_port):
+    home = home_of(cfg, u)
+    written = []
+    for svc in SERVICES:
+        path = f"{cfg['supervisor_conf_dir']}/{svc}_{u}.conf"
+        if svc in components:
+            write_file(path, supervisor_conf(cfg, svc, u, home, node_port, spring_port),
+                       backup=True)
+            written.append(svc)
+        else:
+            remove_file(path)
+    r.step("supervisor_conf", True, ", ".join(written) or "none")
+
+
+def install_sudoers(cfg, path, content):
+    """임시 파일로 visudo -cf 검사 후에만 설치한다."""
+    real = P(path)
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".bh-")  # '.' 포함 파일은 sudo 가 무시
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(tmp, 0o440)
+        run([cfg["bin"]["visudo"], "-cf", tmp])
+        os.replace(tmp, real)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def step_sudoers(cfg, r, u, components):
+    services = [s for s in SERVICES if s in components]
+    path = f"{cfg['sudoers_dir']}/belajarhub-{u}"
+    if services:
+        install_sudoers(cfg, path, sudoers_content(cfg, u, services))
+    else:
+        remove_file(path)
+    r.step("sudoers", True, ", ".join(services) or "none")
+
+
+def step_nginx(cfg, r, u, components, node_port, spring_port, test=True):
+    path = f"{cfg['nginx_conf_dir']}/{u}.conf"
+    real = P(path)
+    old = open(real, encoding="utf-8").read() if os.path.isfile(real) else None
+    write_file(path, nginx_conf(cfg, u, node_port, spring_port, components), backup=True)
+    if test:
+        try:
+            run([cfg["bin"]["nginx"], "-t"])
+        except ProvisionError:
+            # 설정 오류 시 이전 상태로 되돌린다
+            if old is None:
+                remove_file(path)
+            else:
+                write_file(path, old)
+            raise
+    r.step("nginx_conf", True, f"{u}.{cfg['domain']}")
+
+
+# --- MQTT ------------------------------------------------------------------
+def acl_parse(text):
+    """ACL 을 (머리말 줄들, [(username, [줄...]), ...]) 로 나눈다."""
+    header, sections, cur = [], [], None
+    for line in text.splitlines():
+        m = re.match(r"^\s*user\s+(\S+)\s*$", line)
+        if m:
+            cur = (m.group(1), [line])
+            sections.append(cur)
+        elif re.match(r"^\s*pattern\s", line) and cur is not None:
+            cur = None
+            header.append(line)
+        elif cur is None:
+            header.append(line)
+        else:
+            cur[1].append(line)
+    return header, sections
+
+
+def acl_render(header, sections):
+    out = "\n".join(header).rstrip() + "\n"
+    for _, lines in sections:
+        body = "\n".join(lines).strip()
+        out += "\n" + body + "\n"
+    return out
+
+
+def acl_update(cfg, u, present):
+    path = cfg["mosquitto_acl"]
+    real = P(path)
+    text = open(real, encoding="utf-8").read() if os.path.isfile(real) else \
+        f"# Auto-generated student MQTT ACL\n# Topic format: {cfg['mqtt_topic_prefix']}/{{username}}/#\n"
+    header, sections = acl_parse(text)
+    sections = [s for s in sections if s[0] != u]
+    if present:
+        sections.append((u, [f"user {u}", f"topic readwrite {cfg['mqtt_topic_prefix']}/{u}/#"]))
+    write_file(path, acl_render(header, sections), mode=0o644, backup=True)
+
+
+def step_mqtt(cfg, r, u, password):
+    b = cfg["bin"]
+    passwd = cfg["mosquitto_passwd"]
+    if not DRY_RUN and not os.path.isfile(passwd):
+        run([b["mosquitto_passwd"], "-c", "-b", passwd, u, password])
+    else:
+        run([b["mosquitto_passwd"], "-b", P(passwd), u, password])
+    if not DRY_RUN:
+        os.chmod(passwd, 0o640)
+        try:
+            os.chown(passwd, -1, grp.getgrnam("mosquitto").gr_gid)
+        except KeyError:
+            pass
+    acl_update(cfg, u, True)
+    r.step("mqtt", True, f"topic {cfg['mqtt_topic_prefix']}/{u}/#")
+
+
+# --- MariaDB ---------------------------------------------------------------
+def sql_str(s):
+    return "'" + s.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def step_mariadb(cfg, r, u, password):
+    # root 는 unix_socket 인증으로 접속 (Debian/Ubuntu 기본)
+    sql = f"""
+CREATE DATABASE IF NOT EXISTS `{u}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS {sql_str(u)}@'localhost' IDENTIFIED BY {sql_str(password)};
+ALTER USER {sql_str(u)}@'localhost' IDENTIFIED BY {sql_str(password)};
+GRANT ALL PRIVILEGES ON `{u}`.* TO {sql_str(u)}@'localhost';
+FLUSH PRIVILEGES;
+"""
+    run([cfg["bin"]["mariadb"], "-u", "root"], input_text=sql)
+    r.step("mariadb", True, f"database `{u}`")
+
+
+# --- reload ----------------------------------------------------------------
+def do_reload(cfg, r, nginx=True, supervisor=True, mosquitto=True):
+    b = cfg["bin"]
+    if supervisor:
+        try:
+            run([b["supervisorctl"], "reread"])
+            run([b["supervisorctl"], "update"])
+            r.step("reload_supervisor", True)
+        except ProvisionError as e:
+            r.step("reload_supervisor", False, str(e))
+    if nginx:
+        try:
+            run([b["nginx"], "-t"])
+            run([b["systemctl"], "reload", "nginx"])
+            r.step("reload_nginx", True)
+        except ProvisionError as e:
+            r.step("reload_nginx", False, str(e))
+    if mosquitto:
+        try:
+            # passwd/acl 은 SIGHUP(reload)으로 다시 읽는다
+            if run([b["systemctl"], "reload", "mosquitto"], check=False).returncode != 0:
+                run([b["systemctl"], "restart", "mosquitto"])
+            r.step("reload_mosquitto", True)
+        except ProvisionError as e:
+            r.step("reload_mosquitto", False, str(e))
+
+
+# ---------------------------------------------------------------------------
+# 액션
+# ---------------------------------------------------------------------------
+def action_create(cfg, req, r):
+    u = validate_username(req.get("username"))
+    password = validate_password(req.get("password"))
+    components = validate_components(req.get("components", list(ALL_COMPONENTS)))
+    node_port = validate_port(req.get("node_port"), cfg["node_port_range"], "node_port")
+    spring_port = validate_port(req.get("spring_port"), cfg["spring_port_range"], "spring_port")
+    force_change = bool(req.get("force_password_change", False))
+
+    step_group(cfg, r)
+    step_linux_user(cfg, r, u, password, force_change)    # 실패 시 중단 (예외)
+
+    optional = [
+        ("directories", lambda: step_dirs(cfg, r, u, components, node_port, spring_port)),
+    ]
+    if "nodejs" in components:
+        optional.append(("nodered_settings", lambda: step_nodered(cfg, r, u, password, node_port)))
+    optional += [
+        ("supervisor_conf", lambda: step_supervisor(cfg, r, u, components, node_port, spring_port)),
+        ("sudoers", lambda: step_sudoers(cfg, r, u, components)),
+        ("nginx_conf", lambda: step_nginx(cfg, r, u, components, node_port, spring_port,
+                                          test=not req.get("defer_reload"))),
+    ]
+    if "mqtt" in components:
+        optional.append(("mqtt", lambda: step_mqtt(cfg, r, u, password)))
+    else:
+        optional.append(("mqtt_acl", lambda: acl_update(cfg, u, False)))
+    if "mariadb" in components:
+        optional.append(("mariadb", lambda: step_mariadb(cfg, r, u, password)))
+
+    for name, fn in optional:
+        try:
+            fn()
+        except (ProvisionError, OSError, subprocess.SubprocessError) as e:
+            r.step(name, False, str(e))
+
+    if not req.get("defer_reload"):
+        do_reload(cfg, r, mosquitto="mqtt" in components)
+    r.data.update({"username": u, "node_port": node_port, "spring_port": spring_port,
+                   "components": components})
+
+
+def action_password(cfg, req, r):
+    """Linux / Node-RED / MQTT / MariaDB 비밀번호를 한꺼번에 바꾼다."""
+    u = validate_username(req.get("username"))
+    password = validate_password(req.get("password"))
+    components = validate_components(req.get("components", list(ALL_COMPONENTS)))
+    assert_managed(cfg, u)
+    run([cfg["bin"]["chpasswd"]], input_text=f"{u}:{password}\n")
+    r.step("linux_password", True)
+    steps = []
+    if "nodejs" in components:
+        node_port = validate_port(req.get("node_port"), cfg["node_port_range"], "node_port")
+        steps.append(("nodered_settings", lambda: step_nodered(cfg, r, u, password, node_port)))
+    if "mqtt" in components:
+        steps.append(("mqtt", lambda: step_mqtt(cfg, r, u, password)))
+    if "mariadb" in components:
+        steps.append(("mariadb", lambda: step_mariadb(cfg, r, u, password)))
+    for name, fn in steps:
+        try:
+            fn()
+        except (ProvisionError, OSError, subprocess.SubprocessError) as e:
+            r.step(name, False, str(e))
+    if "mqtt" in components:
+        do_reload(cfg, r, nginx=False, supervisor=False, mosquitto=True)
+    if "nodejs" in components:
+        # 새 비밀번호 반영을 위해 실행 중이면 재시작
+        proc = run([cfg["bin"]["supervisorctl"], "status", f"nodejs_{u}"], check=False)
+        if "RUNNING" in (proc.stdout or ""):
+            run([cfg["bin"]["supervisorctl"], "restart", f"nodejs_{u}"], check=False)
+
+
+def action_service(cfg, req, r):
+    u = validate_username(req.get("username"))
+    svc = req.get("service")
+    op = req.get("op")
+    if svc not in SERVICES:
+        raise ProvisionError(f"알 수 없는 service: {svc!r}")
+    if op not in SERVICE_OPS:
+        raise ProvisionError(f"알 수 없는 op: {op!r}")
+    assert_managed(cfg, u)
+    proc = run([cfg["bin"]["supervisorctl"], op, f"{svc}_{u}"], check=False, timeout=60)
+    out = (proc.stdout or proc.stderr or "").strip()
+    # supervisorctl status 는 정지 상태면 rc=3 을 돌려준다 → 오류 아님
+    ok = proc.returncode == 0 or (op == "status" and proc.returncode == 3)
+    if "ERROR" in out or "no such" in out.lower():
+        ok = False
+    r.step(f"{op} {svc}", ok, out)
+    r.data["output"] = out
+
+
+def parse_status(out):
+    # "nodejs_a10029   RUNNING   pid 123, uptime 0:01:02"
+    parts = out.split(None, 2)
+    if len(parts) >= 2 and parts[1].isupper():
+        return {"state": parts[1], "info": parts[2] if len(parts) > 2 else ""}
+    return {"state": "UNKNOWN", "info": out}
+
+
+def action_status(cfg, req, r):
+    u = validate_username(req.get("username"))
+    assert_managed(cfg, u)
+    services = {}
+    for svc in SERVICES:
+        if not os.path.isfile(P(f"{cfg['supervisor_conf_dir']}/{svc}_{u}.conf")):
+            continue
+        proc = run([cfg["bin"]["supervisorctl"], "status", f"{svc}_{u}"], check=False)
+        services[svc] = parse_status((proc.stdout or "").strip()) if not DRY_RUN \
+            else {"state": "STOPPED", "info": "dry-run"}
+    r.data["services"] = services
+    r.step("status", True)
+
+
+def strip_legacy_sudoers(cfg, u):
+    """기존 공용 파일 /etc/sudoers.d/students-supervisor 에서 해당 학생 줄만 제거."""
+    path = cfg["legacy_sudoers_file"]
+    real = P(path)
+    if not os.path.isfile(real):
+        return False
+    lines = open(real, encoding="utf-8").read().splitlines()
+    kept = [l for l in lines if not re.match(rf"^{re.escape(u)}\s", l)]
+    if len(kept) == len(lines):
+        return False
+    shutil.copy2(real, real + ".bak")
+    install_sudoers(cfg, path, "\n".join(kept) + "\n")
+    return True
+
+
+def action_remove(cfg, req, r):
+    u = validate_username(req.get("username"))
+    purge = bool(req.get("purge", False))
+    pw = assert_managed(cfg, u, allow_missing=True)
+    b = cfg["bin"]
+
+    def attempt(name, fn):
+        try:
+            detail = fn()
+            r.step(name, True, detail or "")
+        except (ProvisionError, OSError, subprocess.SubprocessError) as e:
+            r.step(name, False, str(e))
+
+    def stop_services():
+        for svc in SERVICES:
+            run([b["supervisorctl"], "stop", f"{svc}_{u}"], check=False)
+
+    def rm_supervisor():
+        gone = [svc for svc in SERVICES
+                if remove_file(f"{cfg['supervisor_conf_dir']}/{svc}_{u}.conf")]
+        return ", ".join(gone)
+
+    def rm_sudoers():
+        a = remove_file(f"{cfg['sudoers_dir']}/belajarhub-{u}")
+        b_ = strip_legacy_sudoers(cfg, u)
+        return f"own={a}, legacy={b_}"
+
+    def rm_nginx():
+        return str(remove_file(f"{cfg['nginx_conf_dir']}/{u}.conf"))
+
+    def rm_mqtt():
+        if os.path.isfile(P(cfg["mosquitto_passwd"])):
+            run([b["mosquitto_passwd"], "-D", P(cfg["mosquitto_passwd"]), u], check=False)
+        acl_update(cfg, u, False)
+
+    attempt("stop_services", stop_services)
+    attempt("supervisor_conf", rm_supervisor)
+    attempt("sudoers", rm_sudoers)
+    attempt("nginx_conf", rm_nginx)
+    attempt("mqtt", rm_mqtt)
+
+    if purge:
+        def rm_db():
+            run([b["mariadb"], "-u", "root"], input_text=(
+                f"DROP DATABASE IF EXISTS `{u}`;\n"
+                f"DROP USER IF EXISTS {sql_str(u)}@'localhost';\nFLUSH PRIVILEGES;\n"))
+
+        def rm_dirs():
+            return ", ".join(s for s in SRV_DIRS if safe_rmtree(f"{cfg['srv_base']}/{s}", u))
+
+        def rm_user():
+            if pw is not None or DRY_RUN:
+                run([b["userdel"], "-r", u], check=False)
+
+        attempt("mariadb_drop", rm_db)
+        attempt("srv_dirs", rm_dirs)
+        attempt("linux_user", rm_user)
+
+    if not req.get("defer_reload"):
+        do_reload(cfg, r)
+
+
+def action_reload(cfg, req, r):
+    do_reload(cfg, r)
+
+
+ACTIONS = {
+    "create": action_create,
+    "password": action_password,
+    "service": action_service,
+    "status": action_status,
+    "remove": action_remove,
+    "reload": action_reload,
+}
+
+
+def main():
+    if not DRY_RUN and os.geteuid() != 0:
+        print(json.dumps({"ok": False, "error": "root 권한이 필요합니다"}))
+        return 2
+    r = Result()
+    try:
+        raw = sys.stdin.read(65536)
+        req = json.loads(raw)
+        if not isinstance(req, dict):
+            raise ProvisionError("요청은 JSON 객체여야 합니다")
+        action = ACTIONS.get(req.get("action"))
+        if action is None:
+            raise ProvisionError(f"알 수 없는 action: {req.get('action')!r}")
+        cfg = load_config()
+        os.umask(0o022)
+        lock_path = P(cfg["lock_file"])
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        with open(lock_path, "w") as lock:
+            # 동시 실행 직렬화 (ACL/passwd 파일 경합 방지)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            action(cfg, req, r)
+    except (ProvisionError, json.JSONDecodeError, OSError, subprocess.SubprocessError) as e:
+        r.ok = False
+        out = r.as_dict()
+        out["error"] = str(e)
+        print(json.dumps(out, ensure_ascii=False))
+        return 1
+    print(json.dumps(r.as_dict(), ensure_ascii=False))
+    return 0 if r.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

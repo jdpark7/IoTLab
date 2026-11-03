@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}IoT Lab{% endblock %} · BelajarHub</title>
+{% block head %}{% endblock %}
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1d2330;--muted:#667085;--line:#e4e7ec;--accent:#2563eb;--ok:#15803d;--okbg:#dcfce7;--bad:#b42318;--badbg:#fee4e2;--warn:#b54708;--warnbg:#fef0c7}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1f26;--fg:#e6e8eb;--muted:#98a2b3;--line:#2b323c;--accent:#60a5fa;--ok:#4ade80;--okbg:#12301f;--bad:#f97066;--badbg:#3a1714;--warn:#fdb022;--warnbg:#3a2a0b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+header{background:var(--card);border-bottom:1px solid var(--line)}
+header .in{max-width:1180px;margin:0 auto;padding:12px 16px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+header .brand{font-weight:700;color:var(--fg)}header nav{display:flex;gap:14px;flex:1;flex-wrap:wrap}
+main{max-width:1180px;margin:0 auto;padding:20px 16px 60px}
+h1{font-size:22px;margin:0 0 16px}h2{font-size:17px;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:16px}
+.grid{display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);font-weight:600}
+.tablewrap{overflow-x:auto}
+.muted{color:var(--muted)}.mono,code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+.badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:12px;font-weight:600;background:var(--line)}
+.b-active,.b-done,.b-RUNNING{background:var(--okbg);color:var(--ok)}
+.b-failed,.b-FATAL,.b-BACKOFF,.b-EXITED,.b-UNKNOWN{background:var(--badbg);color:var(--bad)}
+.b-provisioning,.b-queued,.b-running,.b-pending,.b-STARTING{background:var(--warnbg);color:var(--warn)}
+.btn,button{display:inline-block;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:6px 12px;border-radius:7px;font:inherit;font-size:14px;cursor:pointer}
+.btn:hover,button:hover{border-color:var(--accent);text-decoration:none}
+.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.danger{color:var(--bad);border-color:var(--bad)}
+input[type=text],input[type=password],input[type=email],input:not([type]),select,textarea{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);width:100%}
+textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+label{font-weight:600;display:block;margin:10px 0 4px}
+.helptext{color:var(--muted);font-size:13px}
+ul.checks{list-style:none;padding:0;display:flex;flex-wrap:wrap;gap:6px 18px}ul.checks label{font-weight:400;display:inline}
+.msgs{list-style:none;padding:0;margin:0 0 16px}.msgs li{padding:10px 14px;border-radius:8px;margin-bottom:8px;background:var(--line)}
+.msgs .success{background:var(--okbg);color:var(--ok)}.msgs .error{background:var(--badbg);color:var(--bad)}.msgs .warning{background:var(--warnbg);color:var(--warn)}
+.errorlist{color:var(--bad);padding-left:18px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.stats{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:110px}
+.stat b{display:block;font-size:22px}
+dl.kv{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:0}dl.kv dt{color:var(--muted)}dl.kv dd{margin:0;word-break:break-all}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:12.5px}
+form.inline{display:inline}
+</style>
+</head>
+<body>
+<header><div class="in">
+  <a class="brand" href="{% url 'home' %}">BelajarHub IoT Lab</a>
+  <nav>
+  {% if user.is_staff %}
+    <a href="{% url 'dashboard' %}">Students</a>
+    <a href="{% url 'enroll' %}">Add students</a>
+    <a href="{% url 'jobs' %}">Jobs</a>
+    <a href="{% url 'admin:index' %}">Admin</a>
+  {% elif user.is_authenticated %}
+    <a href="{% url 'my_lab' %}">My lab</a>
+  {% endif %}
+  </nav>
+  {% if user.is_authenticated %}
+    <span class="muted">{{ user.username }}</span>
+    <a href="{% url 'password_change' %}">Change portal password</a>
+    <form class="inline" method="post" action="{% url 'logout' %}">{% csrf_token %}<button>Log out</button></form>
+  {% endif %}
+</div></header>
+<main>
+{% if messages %}<ul class="msgs">{% for m in messages %}<li class="{{ m.tags }}">{{ m }}</li>{% endfor %}</ul>{% endif %}
+{% block content %}{% endblock %}
+</main>
+</body>
+</html>

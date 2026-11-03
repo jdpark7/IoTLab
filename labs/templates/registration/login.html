@@ -1,0 +1,15 @@
+{% extends "labs/base.html" %}
+{% block title %}Log in{% endblock %}
+{% block content %}
+<div class="card" style="max-width:420px;margin:40px auto">
+  <h1>Log in</h1>
+  <p class="muted">Use your lab username (e.g. <code>a10029</code>) and the password from your instructor.</p>
+  <form method="post">{% csrf_token %}
+    {% if form.non_field_errors %}<ul class="errorlist">{% for e in form.non_field_errors %}<li>{{ e }}</li>{% endfor %}</ul>{% endif %}
+    <label for="id_username">Username</label>{{ form.username }}
+    <label for="id_password">Password</label>{{ form.password }}
+    <input type="hidden" name="next" value="{{ next }}">
+    <p><button class="primary">Log in</button></p>
+  </form>
+</div>
+{% endblock %}

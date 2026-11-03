@@ -1,0 +1,46 @@
+{% extends "labs/base.html" %}
+{% block title %}My lab{% endblock %}
+{% block content %}
+<h1>My IoT lab — {{ s.username }} {% if s.full_name %}<span class="muted">({{ s.full_name }})</span>{% endif %}</h1>
+{% if s.status != "active" %}
+  <div class="card"><span class="badge b-{{ s.status }}">{{ s.get_status_display }}</span> Your environment is not ready yet. Please check back later.</div>
+{% else %}
+<div class="grid">
+  <div class="card">
+    <h2>Your sites</h2>
+    <dl class="kv">{% for label, url in s.links %}<dt>{{ label }}</dt><dd><a href="{{ url }}" target="_blank" rel="noopener">{{ url }}</a></dd>{% endfor %}</dl>
+  </div>
+  <div class="card">
+    <h2>Accounts</h2>
+    <dl class="kv">
+      <dt>SSH</dt><dd><code>ssh {{ s.username }}@{{ LAB_SSH_HOST }}</code></dd>
+      <dt>Username</dt><dd><code>{{ s.username }}</code></dd>
+      <dt>Initial password</dt><dd><code>{{ s.initial_password }}</code><br><span class="helptext">Used for SSH, Node-RED, MQTT and MariaDB. If you changed it with <code>passwd</code>, only SSH uses the new one.</span></dd>
+    </dl>
+  </div>
+  {% if "mqtt" in s.components %}
+  <div class="card">
+    <h2>MQTT</h2>
+    <dl class="kv">
+      <dt>Broker</dt><dd><code>{{ LAB_MQTT_HOST }}:{{ LAB_MQTT_PORT }}</code> (TLS)</dd>
+      <dt>Username</dt><dd><code>{{ s.username }}</code></dd>
+      <dt>Your topics</dt><dd><code>{{ s.mqtt_topic }}</code></dd>
+    </dl>
+  </div>{% endif %}
+  {% if "mariadb" in s.components %}
+  <div class="card">
+    <h2>MariaDB</h2>
+    <dl class="kv"><dt>Host</dt><dd><code>localhost</code></dd><dt>Database</dt><dd><code>{{ s.username }}</code></dd><dt>User</dt><dd><code>{{ s.username }}</code></dd></dl>
+  </div>{% endif %}
+  <div class="card">
+    <h2>Ports</h2>
+    <dl class="kv">
+      {% if "nodejs" in s.components %}<dt>Node-RED</dt><dd><code>{{ s.node_port }}</code> <span class="muted">(~/nodejs-port)</span></dd>{% endif %}
+      {% if "spring" in s.components %}<dt>Spring Boot</dt><dd><code>{{ s.spring_port }}</code> <span class="muted">(--server.port)</span></dd>{% endif %}
+      {% if "django" in s.components %}<dt>Django</dt><dd><code>/run/django/{{ s.username }}.sock</code> <span class="muted">(gunicorn, project <code>myproject</code> in /srv/django/{{ s.username }})</span></dd>{% endif %}
+    </dl>
+  </div>
+</div>
+{% include "labs/_services.html" %}
+{% endif %}
+{% endblock %}
